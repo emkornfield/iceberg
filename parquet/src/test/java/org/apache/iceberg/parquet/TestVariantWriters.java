@@ -359,4 +359,33 @@ public class TestVariantWriters {
       assertThat(readObj.get("city").asPrimitive().get()).isEqualTo("city_" + i);
     }
   }
+
+  @Test
+  public void testShreddingObjectFieldWithSpecialCharacters() throws IOException {
+    // A variant object field whose name contains characters that are special to
+    // JSON-path / metrics normalization ($, [, ], and both single and double quotes)
+    // must still be shreddable and round-trip through the shredded typed_value column.
+    String specialField = "weird$[key]'\"";
+
+    VariantMetadata metadata = Variants.metadata(specialField, "plain");
+    ShreddedObject obj = Variants.object(metadata);
+    obj.put(specialField, Variants.of("shredded-value"));
+    obj.put("plain", Variants.of(42));
+    Variant variant = Variant.of(metadata, obj);
+
+    Record record = RECORD.copy("id", 1, "var", variant);
+
+    // Shred the object, including the special-character field.
+    Record actual =
+        writeAndRead((id, name) -> ParquetVariantUtil.toParquetSchema(variant.value()), record);
+
+    InternalTestHelpers.assertEquals(SCHEMA.asStruct(), record, actual);
+
+    // The special-character field survives the round trip with its exact name and value.
+    Variant readVariant = (Variant) actual.getField("var");
+    VariantObject readObj = readVariant.value().asObject();
+    assertThat(readObj.numFields()).isEqualTo(2);
+    assertThat(readObj.get(specialField).asPrimitive().get()).isEqualTo("shredded-value");
+    assertThat(readObj.get("plain").asPrimitive().get()).isEqualTo(42);
+  }
 }

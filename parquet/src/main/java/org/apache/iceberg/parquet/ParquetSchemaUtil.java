@@ -19,11 +19,14 @@
 package org.apache.iceberg.parquet;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
@@ -133,6 +136,87 @@ public class ParquetSchemaUtil {
     return (MessageType)
         TypeWithSchemaVisitor.visit(
             expectedSchema.asStruct(), fileSchema, new PruneColumns(selectedIds));
+  }
+
+  /**
+   * Prunes the shredded layout of variant columns to a requested set of normalized field paths.
+   *
+   * <p>Variant columns are opaque in the Iceberg schema, so {@link #pruneColumns} keeps the whole
+   * variant. This narrows a shredded variant to only the paths a reader needs: it keeps {@code
+   * metadata}, keeps only the requested shredded fields (each with both its {@code value} and
+   * {@code typed_value} channels, so a value that fell to a field's residual is not lost), and
+   * drops the object-level residual {@code value} unless a requested path is not shredded in this
+   * file (and therefore must be read from the residual). Applying the result as the Parquet
+   * requested schema lets the reader skip the residual blob and unrequested fields.
+   *
+   * <p>Only top-level variant columns (keyed by field id) are pruned, matching where shredding is
+   * applied on write. Paths are matched against the shredded object's field names.
+   *
+   * @param schema a Parquet schema, typically an already-pruned projection
+   * @param variantPaths requested normalized paths per variant field id; empty is a no-op
+   * @return a schema with the named variant columns narrowed to the requested paths
+   */
+  public static MessageType pruneVariantPaths(
+      MessageType schema, Map<Integer, Set<String>> variantPaths) {
+    if (variantPaths.isEmpty()) {
+      return schema;
+    }
+
+    List<Type> fields =
+        schema.getFields().stream()
+            .map(field -> pruneVariantField(field, variantPaths))
+            .collect(Collectors.toList());
+    return new MessageType(schema.getName(), fields);
+  }
+
+  private static Type pruneVariantField(Type field, Map<Integer, Set<String>> variantPaths) {
+    Integer id = field.getId() != null ? field.getId().intValue() : null;
+    if (id != null
+        && variantPaths.containsKey(id)
+        && !field.isPrimitive()
+        && hasField(field.asGroupType(), ParquetVariantVisitor.METADATA)) {
+      return pruneVariantGroup(field.asGroupType(), variantPaths.get(id));
+    }
+
+    return field;
+  }
+
+  private static GroupType pruneVariantGroup(GroupType variant, Set<String> keepPaths) {
+    Type typedValue = fieldType(variant, ParquetVariantVisitor.TYPED_VALUE);
+    GroupType shreddedObject =
+        typedValue != null && !typedValue.isPrimitive() ? typedValue.asGroupType() : null;
+
+    // keep the object residual when a requested path is not a shredded field (needs the fallback)
+    // or when nothing shredded is requested; drop it when every requested path has its own column
+    boolean keepResidual =
+        shreddedObject == null
+            || keepPaths.isEmpty()
+            || keepPaths.stream().anyMatch(path -> !hasField(shreddedObject, path));
+
+    List<Type> kept = Lists.newArrayList();
+    for (Type child : variant.getFields()) {
+      String name = child.getName();
+      if (name.equals(ParquetVariantVisitor.METADATA)) {
+        kept.add(child);
+      } else if (name.equals(ParquetVariantVisitor.VALUE)) {
+        if (keepResidual) {
+          kept.add(child);
+        }
+      } else if (name.equals(ParquetVariantVisitor.TYPED_VALUE) && shreddedObject != null) {
+        List<Type> keptFields =
+            shreddedObject.getFields().stream()
+                .filter(shredded -> keepPaths.contains(shredded.getName()))
+                .collect(Collectors.toList());
+        if (!keptFields.isEmpty()) {
+          kept.add(shreddedObject.withNewFields(keptFields));
+        }
+      } else {
+        // scalar-shredded typed_value, or an unrecognized child: keep as-is
+        kept.add(child);
+      }
+    }
+
+    return variant.withNewFields(kept);
   }
 
   /**

@@ -70,23 +70,31 @@ class ReadConf<T> {
       NameMapping nameMapping,
       boolean reuseContainers,
       boolean caseSensitive,
-      Integer bSize) {
+      Integer bSize,
+      Map<Integer, Set<String>> variantProjection) {
     this.file = file;
     this.options = options;
     this.reader = newReader(file, options);
     MessageType fileSchema = reader.getFileMetaData().getSchema();
 
     MessageType typeWithIds;
+    MessageType columnProjection;
     if (ParquetSchemaUtil.hasIds(fileSchema)) {
       typeWithIds = fileSchema;
-      this.projection = ParquetSchemaUtil.pruneColumns(fileSchema, expectedSchema);
+      columnProjection = ParquetSchemaUtil.pruneColumns(fileSchema, expectedSchema);
     } else if (nameMapping != null) {
       typeWithIds = ParquetSchemaUtil.applyNameMapping(fileSchema, nameMapping);
-      this.projection = ParquetSchemaUtil.pruneColumns(typeWithIds, expectedSchema);
+      columnProjection = ParquetSchemaUtil.pruneColumns(typeWithIds, expectedSchema);
     } else {
       typeWithIds = ParquetSchemaUtil.addFallbackIds(fileSchema);
-      this.projection = ParquetSchemaUtil.pruneColumnsFallback(fileSchema, expectedSchema);
+      columnProjection = ParquetSchemaUtil.pruneColumnsFallback(fileSchema, expectedSchema);
     }
+
+    // Narrow shredded variant columns to the requested normalized paths. The physical projection
+    // and the reader model must use the same pruned variant layout; typeWithIds stays intact so
+    // row-group filtering still sees the full schema. An empty map is a no-op.
+    this.projection = ParquetSchemaUtil.pruneVariantPaths(columnProjection, variantProjection);
+    MessageType readerSchema = ParquetSchemaUtil.pruneVariantPaths(typeWithIds, variantProjection);
 
     this.rowGroups = reader.getRowGroups();
     this.shouldSkip = new boolean[rowGroups.size()];
@@ -118,12 +126,12 @@ class ReadConf<T> {
 
     this.totalValues = computedTotalValues;
     if (readerFunc != null) {
-      this.model = (ParquetValueReader<T>) readerFunc.apply(typeWithIds);
+      this.model = (ParquetValueReader<T>) readerFunc.apply(readerSchema);
       this.vectorizedModel = null;
       this.columnChunkMetaDataForRowGroups = null;
     } else {
       this.model = null;
-      this.vectorizedModel = (VectorizedReader<T>) batchedReaderFunc.apply(typeWithIds);
+      this.vectorizedModel = (VectorizedReader<T>) batchedReaderFunc.apply(readerSchema);
       this.columnChunkMetaDataForRowGroups = getColumnChunkMetadataForRowGroups();
     }
 
