@@ -170,15 +170,30 @@ public class ParquetSchemaUtil {
   }
 
   private static Type pruneVariantField(Type field, Map<Integer, Set<String>> variantPaths) {
-    Integer id = field.getId() != null ? field.getId().intValue() : null;
-    if (id != null
-        && variantPaths.containsKey(id)
-        && !field.isPrimitive()
-        && hasField(field.asGroupType(), ParquetVariantVisitor.METADATA)) {
-      return pruneVariantGroup(field.asGroupType(), variantPaths.get(id));
+    if (field.isPrimitive()) {
+      return field;
     }
 
-    return field;
+    GroupType group = field.asGroupType();
+    boolean isVariant =
+        hasField(group, ParquetVariantVisitor.METADATA)
+            && hasField(group, ParquetVariantVisitor.VALUE);
+    if (isVariant) {
+      Integer id = field.getId() != null ? field.getId().intValue() : null;
+      if (id != null && variantPaths.containsKey(id)) {
+        return pruneVariantGroup(group, variantPaths.get(id));
+      }
+
+      // a variant that wasn't requested: keep it whole, never recurse into its internals
+      return field;
+    }
+
+    // a struct/list/map: recurse so nested variant columns (e.g. content_stats bounds) are reached
+    List<Type> children =
+        group.getFields().stream()
+            .map(child -> pruneVariantField(child, variantPaths))
+            .collect(Collectors.toList());
+    return group.withNewFields(children);
   }
 
   private static GroupType pruneVariantGroup(GroupType variant, Set<String> keepPaths) {

@@ -1,6 +1,6 @@
 # Shredding Variant Bounds in V4 Manifests
 
-**Status:** prototype passing · leaf-level only · no aggregation · **blocked on `content_stats` write (#13694)**
+**Status:** end-to-end working on branch `variant-bounds-shredding` (write shredded bounds → read via `V4ManifestReader` → prune, incl. read projection) · leaf-level only · no aggregation · builds on merged PR #17433 (read side)
 
 Can a variant column's statistics bounds be shredded the way data files shred variant
 columns — and does the read side actually get faster? This note captures the mechanism, a
@@ -291,7 +291,34 @@ row-group filtering. `readBuilderVariantProjectionReadsOnlyRequestedPath` exerci
 `Parquet.read().withVariantProjection(...)` reconstructs an object with only the requested path.
 The vectorized path is unchanged (passes an empty map).
 
-**Remaining (integration with the manifest scan):** `V4ManifestReader` should populate the hint
-from the scan filter's `BoundExtract` paths (extending #17433 `projectStats`) so manifest planning
-uses it automatically. That is the only piece left, and it lives in the (still-in-flight) v4
-manifest read path rather than the Parquet layer, which is now complete.
+**Landed (manifest integration):** `V4ManifestReader.Builder.projectStatsPaths(Map<fieldId,
+Set<path>>)` now carries the hint; `open()` translates each table variant field id to its
+`lower_bound`/`upper_bound` stats field ids (`StatsUtil.toBaseId` + offsets) and calls
+`withVariantProjection` on the read. The hint reaches Parquet through a new no-op default on the
+`InternalData.ReadBuilder` SPI (Avro inherits it; the Parquet builder overrides it).
+`pruneVariantPaths` was made recursive so it reaches the nested `content_stats.<field>.lower_bound`
+variants.
+
+## 11. End-to-end status (this branch)
+
+The full path is implemented and tested on `variant-bounds-shredding`:
+
+- **Write** — a V4 (`TrackedFile`) manifest is written via `Parquet.write(...).variantShreddingFunc(...)`
+  with `content_stats` populated; the func shreds the `lower_bound`/`upper_bound` variant columns
+  (keyed by their stats field ids). `TypeToMessageType` calls the func for these *nested* variants,
+  so no top-level restriction applies.
+- **Read** — the real `V4ManifestReader` (PR #17433, merged into this branch) reconstructs the
+  shredded bounds; `projectStatsPaths` narrows the read to requested normalized paths.
+- **Prune** — reconstructed bounds prune files by a variant subfield predicate.
+
+Tests (`parquet` module, package `org.apache.iceberg`):
+`TestV4ManifestVariantBoundsShredding` — `shreddedVariantBoundsRoundTripThroughV4ManifestReader`
+(asserts the manifest's `content_stats.var.{lower,upper}_bound.typed_value.$['x'].typed_value`
+columns exist and bounds round-trip), `shreddedVariantBoundsPruneFiles`,
+`projectStatsPathsReadsOnlyRequestedPath` (only the requested path materializes).
+
+**Not covered:** wiring the write population into the production `ManifestWriter.V4Writer`
+(`V4Metadata.DataFileWrapper`) — the tests write `TrackedFile` structs directly, the same way
+#17433's tests do; attaching `ContentStats` to entries inside the production writer from a data
+file's `FieldMetrics` remains the province of draft #13694. And sourcing `projectStatsPaths` from
+a scan's `BoundExtract` expressions (rather than a caller-supplied map) is left to the scan layer.

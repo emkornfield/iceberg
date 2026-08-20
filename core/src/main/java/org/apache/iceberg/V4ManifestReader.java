@@ -54,6 +54,8 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
   private final boolean includeAll;
   private final ScanMetrics scanMetrics;
   private final String tableLocation;
+  // requested normalized paths per table variant field id, for narrowing shredded variant bounds
+  private final Map<Integer, Set<String>> variantStatsPaths;
 
   // partition filters keyed by spec ID; empty when no partition filter applies
   private final Map<Integer, Pair<Evaluator, StructProjection>> partitionFilters;
@@ -64,13 +66,15 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
       Map<Integer, Pair<Evaluator, StructProjection>> partitionFilters,
       boolean includeAll,
       ScanMetrics scanMetrics,
-      String tableLocation) {
+      String tableLocation,
+      Map<Integer, Set<String>> variantStatsPaths) {
     this.file = file;
     this.readSchema = readSchema;
     this.partitionFilters = partitionFilters;
     this.includeAll = includeAll;
     this.scanMetrics = scanMetrics;
     this.tableLocation = tableLocation;
+    this.variantStatsPaths = variantStatsPaths;
   }
 
   static Builder builder(
@@ -155,6 +159,21 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
       }
     }
 
+    // narrow shredded variant bound columns to the requested normalized paths, so a variant
+    // bound is read from only those paths' columns and skips the residual and other fields
+    if (!variantStatsPaths.isEmpty()) {
+      Map<Integer, Set<String>> byBoundFieldId = Maps.newHashMap();
+      for (Map.Entry<Integer, Set<String>> entry : variantStatsPaths.entrySet()) {
+        int baseId = StatsUtil.toBaseId(entry.getKey());
+        if (baseId >= 0) {
+          byBoundFieldId.put(baseId + StatsUtil.LOWER_BOUND_OFFSET, entry.getValue());
+          byBoundFieldId.put(baseId + StatsUtil.UPPER_BOUND_OFFSET, entry.getValue());
+        }
+      }
+
+      readBuilder.withVariantProjection(byBoundFieldId);
+    }
+
     CloseableIterable<TrackedFile> reader = readBuilder.build();
     addCloseable(reader);
     return reader;
@@ -204,6 +223,7 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
     private Collection<String> columns = null;
     private Schema requestedProjection = null;
     private Set<Integer> fieldIdsWithRequestedStats = null;
+    private Map<Integer, Set<String>> variantStatsPaths = ImmutableMap.of();
     private MetricsConfig metricsConfig = null;
     private ScanMetrics scanMetrics = ScanMetrics.noop();
 
@@ -298,6 +318,21 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
     }
 
     /**
+     * Reads a variant column's content stats bounds from only the given normalized JSON paths.
+     *
+     * <p>When a variant bound is shredded, this narrows the read to the requested paths' columns,
+     * skipping the object residual and unrequested fields (see {@code
+     * ParquetSchemaUtil.pruneVariantPaths}). Bounds for unlisted variant fields are read in full.
+     *
+     * @param pathsByFieldId requested normalized paths per table variant field id
+     */
+    Builder projectStatsPaths(Map<Integer, Set<String>> pathsByFieldId) {
+      Preconditions.checkArgument(pathsByFieldId != null, "Invalid stats paths: null");
+      this.variantStatsPaths = ImmutableMap.copyOf(pathsByFieldId);
+      return this;
+    }
+
+    /**
      * Sets the metrics config that determines which stats the manifest holds. Defaults to the
      * config produced by the table's default metrics properties.
      */
@@ -334,7 +369,8 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
           partitionFilters,
           includeAll,
           scanMetrics,
-          tableLocation);
+          tableLocation,
+          variantStatsPaths);
     }
 
     private Schema readSchema(boolean hasPartitionFilter) {

@@ -1405,6 +1405,7 @@ public class Parquet {
      * @param newVariantProjection requested normalized paths per variant field id
      * @return this builder for method chaining
      */
+    @Override
     public ReadBuilder withVariantProjection(Map<Integer, Set<String>> newVariantProjection) {
       this.variantProjection = ImmutableMap.copyOf(newVariantProjection);
       return this;

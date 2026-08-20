@@ -184,6 +184,15 @@ public class InternalData {
     /** Set a custom class for in-memory objects at the given field ID. */
     ReadBuilder setCustomType(int fieldId, Class<? extends StructLike> structClass);
 
+    /**
+     * Narrows shredded variant columns to a set of requested normalized paths per variant field
+     * id. Formats without shredding ignore it. Default is a no-op.
+     */
+    default ReadBuilder withVariantProjection(
+        java.util.Map<Integer, java.util.Set<String>> variantProjection) {
+      return this;
+    }
+
     /** Build the configured reader. */
     <D> CloseableIterable<D> build();
   }
