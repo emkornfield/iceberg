@@ -85,6 +85,22 @@ public abstract class ManifestWriter<F extends ContentFile<F>> implements FileAp
   protected abstract FileAppender<ManifestEntry<F>> newAppender(
       PartitionSpec spec, OutputFile outputFile);
 
+  /**
+   * Prepares the file of an ADDED entry before it is written.
+   *
+   * <p>The absolute first_row_id of an added file cannot be known when the manifest is written
+   * because the manifest's base offset is only assigned later, when the manifest list is written.
+   * By default the value is therefore suppressed (written as null) and resolved at read time. Row
+   * lineage writers override this to encode the relative row offset instead (see {@link
+   * Delegates#relativeFirstRowId}).
+   *
+   * @param file the added file
+   * @param relativeRowOffset number of rows added to this manifest before this file (0-based)
+   */
+  protected F prepareAddedFile(F file, long relativeRowOffset) {
+    return Delegates.suppressFirstRowId(file);
+  }
+
   private OutputFile outputFile(EncryptedOutputFile encryptedFile) {
     // Casting to NativeEncryptionOutputFile actually makes the file rely on native encryption
     // rather than whole-file encryption.
@@ -145,7 +161,7 @@ public abstract class ManifestWriter<F extends ContentFile<F>> implements FileAp
    */
   @Override
   public void add(F addedFile) {
-    addEntry(reused.wrapAppend(snapshotId, addedFile));
+    addEntry(reused.wrapAppend(snapshotId, prepareAddedFile(addedFile, addedRows)));
   }
 
   /**
@@ -159,14 +175,20 @@ public abstract class ManifestWriter<F extends ContentFile<F>> implements FileAp
    * @param dataSequenceNumber a data sequence number for the file
    */
   public void add(F addedFile, long dataSequenceNumber) {
-    addEntry(reused.wrapAppend(snapshotId, dataSequenceNumber, addedFile));
+    addEntry(
+        reused.wrapAppend(
+            snapshotId, dataSequenceNumber, prepareAddedFile(addedFile, addedRows)));
   }
 
   void add(ManifestEntry<F> entry) {
     if (entry.dataSequenceNumber() != null && entry.dataSequenceNumber() >= 0) {
-      addEntry(reused.wrapAppend(snapshotId, entry.dataSequenceNumber(), entry.file()));
+      addEntry(
+          reused.wrapAppend(
+              snapshotId,
+              entry.dataSequenceNumber(),
+              prepareAddedFile(entry.file(), addedRows)));
     } else {
-      addEntry(reused.wrapAppend(snapshotId, entry.file()));
+      addEntry(reused.wrapAppend(snapshotId, prepareAddedFile(entry.file(), addedRows)));
     }
   }
 
@@ -282,6 +304,11 @@ public abstract class ManifestWriter<F extends ContentFile<F>> implements FileAp
     }
 
     @Override
+    protected DataFile prepareAddedFile(DataFile file, long relativeRowOffset) {
+      return Delegates.relativeFirstRowId(file, relativeRowOffset);
+    }
+
+    @Override
     protected ManifestEntry<DataFile> prepare(ManifestEntry<DataFile> entry) {
       return entryWrapper.wrap(entry);
     }
@@ -367,6 +394,11 @@ public abstract class ManifestWriter<F extends ContentFile<F>> implements FileAp
       Preconditions.checkArgument(
           format() == FileFormat.AVRO, "V3 manifests must use Avro, but got: %s", format());
       this.entryWrapper = new V3Metadata.ManifestEntryWrapper<>(snapshotId);
+    }
+
+    @Override
+    protected DataFile prepareAddedFile(DataFile file, long relativeRowOffset) {
+      return Delegates.relativeFirstRowId(file, relativeRowOffset);
     }
 
     @Override

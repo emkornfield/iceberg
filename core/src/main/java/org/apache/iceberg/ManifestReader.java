@@ -440,17 +440,34 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
   private static <F extends ContentFile<F>> Function<ManifestEntry<F>, ManifestEntry<F>> idAssigner(
       Long firstRowId, boolean isCommitted) {
     if (firstRowId != null) {
+      long base = firstRowId;
       return new Function<>() {
-        private long nextRowId = firstRowId;
+        // tracks the next unassigned absolute id; only consulted for the legacy fallback below
+        private long nextRowId = base;
 
         @Override
         public ManifestEntry<F> apply(ManifestEntry<F> entry) {
           if (entry.file() instanceof BaseFile && entry.status() != ManifestEntry.Status.DELETED) {
             BaseFile<?> file = (BaseFile<?>) entry.file();
-            if (null == file.firstRowId()) {
-              file.setFirstRowId(nextRowId);
-              nextRowId += file.recordCount();
+            Long stored = file.firstRowId();
+            if (stored == null || stored < 0) {
+              long assigned;
+              if (stored == null) {
+                // Legacy fallback for pre-v3 (v2-origin) data files whose manifests were never
+                // rewritten with an encoded offset (the excluded "v2 issue"). The counter is dead
+                // code once every entry is written by a row-lineage writer.
+                assigned = nextRowId;
+              } else {
+                // first_row_id encodes the relative row offset within the manifest as
+                // -(offset + 1); recover the absolute id with no dependence on read state.
+                assigned = base - stored - 1;
+              }
+              file.setFirstRowId(assigned);
+              // keep the counter in sync so any following un-encoded entries continue correctly,
+              // even when encoded and legacy entries are interleaved (e.g. after an upgrade + merge)
+              nextRowId = assigned + file.recordCount();
             }
+            // otherwise stored >= 0: the value is already an absolute first_row_id
           }
 
           return entry;
