@@ -41,6 +41,28 @@ class Delegates {
     return file;
   }
 
+  /**
+   * Encodes the relative row offset of an ADDED file within its manifest into the first_row_id
+   * field, so the absolute value can be resolved at read time without a stateful, null-driven scan.
+   *
+   * <p>The offset is stored as {@code -(relativeRowOffset + 1)}: negative so a reader can tell it
+   * apart from an already-absolute (non-negative) value by its sign, and shifted by one so the
+   * first added row (offset 0) does not collide with an absolute value of 0. A reader recovers the
+   * absolute id as {@code manifestFirstRowId - stored - 1}.
+   *
+   * @param file the added file
+   * @param relativeRowOffset number of rows added to this manifest before this file (0-based)
+   */
+  static DataFile relativeFirstRowId(DataFile file, long relativeRowOffset) {
+    long encoded = -(relativeRowOffset + 1);
+    return new DelegatingDataFile(file) {
+      @Override
+      public Long firstRowId() {
+        return encoded;
+      }
+    };
+  }
+
   static DeleteFile pendingDeleteFile(DeleteFile file, Long dataSequenceNumber) {
     return new PendingDeleteFile(file, dataSequenceNumber);
   }

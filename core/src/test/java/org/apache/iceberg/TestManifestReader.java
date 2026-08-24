@@ -234,6 +234,27 @@ public class TestManifestReader extends TestBase {
   }
 
   @TestTemplate
+  public void testAddedFilesEncodeRelativeFirstRowId() throws IOException {
+    assumeThat(formatVersion)
+        .as("first_row_id is only written in v3+ manifests")
+        .isGreaterThanOrEqualTo(3);
+
+    // both files are added, so their first_row_id is written as the negated 1-based relative row
+    // offset within the manifest: FILE_A at offset 0 -> -1, FILE_B after FILE_A's rows -> -2
+    ManifestFile manifest = writeManifest(1000L, FILE_A, FILE_B);
+    assertThat(manifest.firstRowId()).isNull();
+
+    // reading uncommitted preserves the raw on-disk values, exposing the relative encoding
+    try (ManifestReader<DataFile> reader =
+        ManifestFiles.read(manifest, FILE_IO, table.specs(), false /* isCommitted */)) {
+      List<DataFile> files = Lists.newArrayList(reader);
+      assertThat(files).hasSize(2);
+      assertThat(files.get(0).firstRowId()).isEqualTo(-1L);
+      assertThat(files.get(1).firstRowId()).isEqualTo(-(FILE_A.recordCount() + 1));
+    }
+  }
+
+  @TestTemplate
   public void testReadUncommittedManifestPreservesEntryRowId() throws IOException {
     assumeThat(formatVersion)
         .as("first_row_id is only written in v3+ manifests")
