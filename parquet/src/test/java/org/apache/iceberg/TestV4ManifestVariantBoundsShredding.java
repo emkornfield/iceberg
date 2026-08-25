@@ -24,9 +24,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.InternalWriter;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.inmemory.InMemoryOutputFile;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
@@ -63,13 +68,13 @@ public class TestV4ManifestVariantBoundsShredding {
   private static final int VAR_FIELD_ID = 12;
   private static final Schema TABLE_SCHEMA =
       new Schema(optional(VAR_FIELD_ID, "var", Types.VariantType.get()));
-  private static final Types.StructType STATS_TYPE =
-      StatsUtil.statsWriteSchema(
+  private static final MetricsConfig FULL_METRICS =
+      MetricsConfig.from(
+          ImmutableMap.of(TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX + "var", "full"),
           TABLE_SCHEMA,
-          MetricsConfig.from(
-              ImmutableMap.of(TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX + "var", "full"),
-              TABLE_SCHEMA,
-              null));
+          null);
+  private static final Types.StructType STATS_TYPE =
+      StatsUtil.statsWriteSchema(TABLE_SCHEMA, FULL_METRICS);
   private static final Types.StructType VAR_STATS_TYPE = STATS_TYPE.fieldType("var").asStructType();
   private static final int LOWER_BOUND_ID = VAR_STATS_TYPE.field("lower_bound").fieldId();
   private static final int UPPER_BOUND_ID = VAR_STATS_TYPE.field("upper_bound").fieldId();
@@ -80,6 +85,7 @@ public class TestV4ManifestVariantBoundsShredding {
       ImmutableMap.of(PartitionSpec.unpartitioned().specId(), PartitionSpec.unpartitioned());
   private static final String TABLE_LOCATION = "s3://bucket/db/table";
   private static final String X = "$['x']";
+  private static final String Y = "$['y']";
 
   @Test
   public void shreddedVariantBoundsRoundTripThroughV4ManifestReader() throws IOException {
@@ -145,30 +151,149 @@ public class TestV4ManifestVariantBoundsShredding {
   @Test
   public void projectStatsPathsReadsOnlyRequestedPath() throws IOException {
     // bounds carry two shredded paths; the reader is asked for only x
-    VariantMetadata metadata = Variants.metadata(X, "$['y']");
+    VariantMetadata metadata = Variants.metadata(X, Y);
     Variant lower = twoPathBound(metadata, 1, 100);
     Variant upper = twoPathBound(metadata, 10, 200);
     InputFile manifest = writeShreddedManifest(List.of(lower), List.of(upper));
 
+    // both x and y are genuinely shredded into their own columns, so requesting one truly
+    // exercises "two shredded columns, read one"
+    MessageType schema = ParquetManifestTestUtil.parquetSchema(manifest);
+    assertThat(
+            ParquetManifestTestUtil.hasLeaf(
+                schema, "content_stats", "var", "lower_bound", "typed_value", X, "typed_value"))
+        .as("x shredded")
+        .isTrue();
+    assertThat(
+            ParquetManifestTestUtil.hasLeaf(
+                schema, "content_stats", "var", "lower_bound", "typed_value", Y, "typed_value"))
+        .as("y shredded")
+        .isTrue();
+
     try (V4ManifestReader reader =
         V4ManifestReader.builder(manifest, TABLE_SCHEMA, UNPARTITIONED_SPECS, TABLE_LOCATION)
-            .projectStatsPaths(ImmutableMap.of(VAR_FIELD_ID, java.util.Set.of(X)))
+            .projectStatsPaths(ImmutableMap.of(VAR_FIELD_ID, Set.of(X)))
             .build()) {
-      FieldStats<?> stats =
-          reader.iterator().next().contentStats().statsFor(VAR_FIELD_ID);
+      FieldStats<?> stats = reader.iterator().next().contentStats().statsFor(VAR_FIELD_ID);
       VariantObject lowerBounds = ((Variant) stats.lowerBound()).value().asObject();
 
       // only the requested path was materialized; y (and any residual) was skipped
       assertThat((int) lowerBounds.get(X).asPrimitive().get()).isEqualTo(1);
-      assertThat(lowerBounds.get("$['y']")).isNull();
+      assertThat(lowerBounds.get(Y)).isNull();
       assertThat(lowerBounds.numFields()).isEqualTo(1);
     }
+  }
+
+  @Test
+  public void filterOnShreddedValueReadsOnlyThatPathFromRealData() throws IOException {
+    // 1. Real data: a variant column "var" whose objects carry both x and y, physically shredded
+    // exactly the way a data file shreds a variant column. Data fields are raw names (x, y); the
+    // metrics collector normalizes them to JSON paths ($['x'], $['y']) in the bounds it produces.
+    List<Variant> dataRows = List.of(dataRow(1, 100), dataRow(5, 50), dataRow(3, 200));
+    InputFile dataFile = writeShreddedVariantDataFile(dataRows);
+
+    // 2. Real metrics: derive the content-stats variant bounds from the data file's own shredded
+    // column statistics, not from hand-built bounds.
+    FieldMetrics<?> varMetrics =
+        ParquetManifestTestUtil.fieldMetrics(dataFile, TABLE_SCHEMA, FULL_METRICS)
+            .get(VAR_FIELD_ID);
+    Variant lower = (Variant) varMetrics.lowerBound();
+    Variant upper = (Variant) varMetrics.upperBound();
+    // the metrics recorded both shredded paths: x in [1, 5], y in [50, 200]
+    assertThat(lower.value().asObject().numFields()).isEqualTo(2);
+    assertThat((int) lower.value().asObject().get(X).asPrimitive().get()).isEqualTo(1);
+    assertThat((int) upper.value().asObject().get(X).asPrimitive().get()).isEqualTo(5);
+
+    // 3. Write the real bounds into a V4 manifest with the bound columns shredded on x and y.
+    InputFile manifest = writeShreddedManifest(List.of(lower), List.of(upper));
+    MessageType schema = ParquetManifestTestUtil.parquetSchema(manifest);
+    assertThat(
+            ParquetManifestTestUtil.hasLeaf(
+                schema, "content_stats", "var", "lower_bound", "typed_value", X, "typed_value"))
+        .as("x shredded in the manifest")
+        .isTrue();
+    assertThat(
+            ParquetManifestTestUtil.hasLeaf(
+                schema, "content_stats", "var", "lower_bound", "typed_value", Y, "typed_value"))
+        .as("y shredded in the manifest")
+        .isTrue();
+
+    // 4. A query filter that touches only the x sub-path of the variant. During scan planning the
+    // reader derives the shredded stat paths to read from the filter's extract() terms itself, so
+    // no explicit projection is needed: reading materializes only x, and y is never read back.
+    Expression filter = Expressions.greaterThanOrEqual(Expressions.extract("var", "$.x", "int"), 0);
+    try (V4ManifestReader reader =
+        V4ManifestReader.builder(manifest, TABLE_SCHEMA, UNPARTITIONED_SPECS, TABLE_LOCATION)
+            .forScanPlanning()
+            .filter(filter)
+            .build()) {
+      FieldStats<?> stats = reader.iterator().next().contentStats().statsFor(VAR_FIELD_ID);
+      VariantObject lowerBounds = ((Variant) stats.lowerBound()).value().asObject();
+
+      assertThat((int) lowerBounds.get(X).asPrimitive().get()).isEqualTo(1);
+      assertThat(lowerBounds.get(Y)).as("y is not in the filter, so it is not read").isNull();
+      assertThat(lowerBounds.numFields()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void filterExtractPathDoesNotNarrowBoundsInFullRead() throws IOException {
+    // the same filter, but a full read (no scan planning / projectStats) keeps complete bounds so
+    // entries can be copied into a new manifest without losing bounds for the unqueried path
+    VariantMetadata metadata = Variants.metadata(X, Y);
+    InputFile manifest =
+        writeShreddedManifest(
+            List.of(twoPathBound(metadata, 1, 100)), List.of(twoPathBound(metadata, 10, 200)));
+    Expression filter = Expressions.greaterThanOrEqual(Expressions.extract("var", "$.x", "int"), 0);
+
+    try (V4ManifestReader reader =
+        V4ManifestReader.builder(manifest, TABLE_SCHEMA, UNPARTITIONED_SPECS, TABLE_LOCATION)
+            .filter(filter)
+            .build()) {
+      FieldStats<?> stats = reader.iterator().next().contentStats().statsFor(VAR_FIELD_ID);
+      VariantObject lowerBounds = ((Variant) stats.lowerBound()).value().asObject();
+
+      assertThat(lowerBounds.numFields()).as("full read keeps all shredded paths").isEqualTo(2);
+      assertThat(lowerBounds.get(Y)).isNotNull();
+    }
+  }
+
+  /** Writes a real data file whose variant "var" column is shredded on its frequent paths. */
+  private static InputFile writeShreddedVariantDataFile(List<Variant> rows) throws IOException {
+    List<VariantValue> values = rows.stream().map(Variant::value).collect(Collectors.toList());
+    Type shredded = analyze(values);
+    VariantShreddingFunction shreddingFunc =
+        (fieldId, name) -> fieldId == VAR_FIELD_ID ? shredded : null;
+
+    OutputFile out = new InMemoryOutputFile("data.parquet");
+    GenericRecord row = GenericRecord.create(TABLE_SCHEMA);
+    try (FileAppender<Record> appender =
+        Parquet.write(out)
+            .schema(TABLE_SCHEMA)
+            .variantShreddingFunc(shreddingFunc)
+            .createWriterFunc(msgType -> InternalWriter.create(TABLE_SCHEMA.asStruct(), msgType))
+            .build()) {
+      for (Variant value : rows) {
+        appender.add(row.copy("var", value));
+      }
+    }
+
+    return out.toInputFile();
+  }
+
+  /** A data-file variant row with raw field names, as a real variant column would store them. */
+  private static Variant dataRow(int x, int y) {
+    VariantMetadata metadata = Variants.metadata("x", "y");
+    ShreddedObject object = Variants.object(metadata);
+    object.put("x", Variants.of(x));
+    object.put("y", Variants.of(y));
+    return Variant.of(metadata, object);
   }
 
   private static Variant twoPathBound(VariantMetadata metadata, int x, int y) {
     ShreddedObject object = Variants.object(metadata);
     object.put(X, Variants.of(x));
-    object.put("$['y']", Variants.of(y));
+    object.put(Y, Variants.of(y));
     return Variant.of(metadata, object);
   }
 

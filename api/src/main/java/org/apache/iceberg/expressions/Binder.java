@@ -19,11 +19,14 @@
 package org.apache.iceberg.expressions;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.ExpressionVisitors.ExpressionVisitor;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types.StructType;
@@ -99,6 +102,37 @@ public class Binder {
       }
     }
     return visitor.references;
+  }
+
+  /**
+   * Returns the normalized variant JSON paths referenced by {@code extract()} terms, grouped by the
+   * variant field id each term extracts from.
+   *
+   * <p>This is the read-side complement to {@link #boundReferences(StructType, List, boolean)}:
+   * where that returns the field ids a filter touches, this returns the specific variant sub-paths,
+   * so a caller can narrow a shredded variant stats read to only those paths (for example {@code
+   * V4ManifestReader.Builder#projectStatsPaths}). Predicates that are not {@code extract()} terms
+   * contribute nothing.
+   *
+   * @param struct the struct type used to resolve references by name
+   * @param exprs expressions to inspect; each may be bound or unbound
+   * @param caseSensitive whether name resolution is case sensitive
+   * @return normalized paths per variant field id, empty when no {@code extract()} term is present
+   */
+  public static Map<Integer, Set<String>> extractPaths(
+      StructType struct, List<Expression> exprs, boolean caseSensitive) {
+    if (exprs == null) {
+      return ImmutableMap.of();
+    }
+    ExtractPathVisitor visitor = new ExtractPathVisitor();
+    for (Expression expr : exprs) {
+      if (isBound(expr)) {
+        ExpressionVisitors.visit(expr, visitor);
+      } else {
+        ExpressionVisitors.visit(bind(struct, expr, caseSensitive), visitor);
+      }
+    }
+    return visitor.pathsByFieldId;
   }
 
   /**
@@ -202,6 +236,49 @@ public class Binder {
     public <T> Set<Integer> predicate(BoundPredicate<T> pred) {
       references.add(pred.ref().fieldId());
       return references;
+    }
+  }
+
+  private static class ExtractPathVisitor extends ExpressionVisitor<Map<Integer, Set<String>>> {
+    private final Map<Integer, Set<String>> pathsByFieldId = Maps.newHashMap();
+
+    @Override
+    public Map<Integer, Set<String>> alwaysTrue() {
+      return pathsByFieldId;
+    }
+
+    @Override
+    public Map<Integer, Set<String>> alwaysFalse() {
+      return pathsByFieldId;
+    }
+
+    @Override
+    public Map<Integer, Set<String>> not(Map<Integer, Set<String>> result) {
+      return pathsByFieldId;
+    }
+
+    @Override
+    public Map<Integer, Set<String>> and(
+        Map<Integer, Set<String>> leftResult, Map<Integer, Set<String>> rightResult) {
+      return pathsByFieldId;
+    }
+
+    @Override
+    public Map<Integer, Set<String>> or(
+        Map<Integer, Set<String>> leftResult, Map<Integer, Set<String>> rightResult) {
+      return pathsByFieldId;
+    }
+
+    @Override
+    public <T> Map<Integer, Set<String>> predicate(BoundPredicate<T> pred) {
+      if (pred.term() instanceof BoundExtract) {
+        BoundExtract<?> extract = (BoundExtract<?>) pred.term();
+        pathsByFieldId
+            .computeIfAbsent(extract.ref().fieldId(), id -> Sets.newHashSet())
+            .add(extract.path());
+      }
+
+      return pathsByFieldId;
     }
   }
 

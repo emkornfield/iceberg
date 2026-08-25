@@ -20,8 +20,15 @@ package org.apache.iceberg.parquet;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Map;
+import java.util.stream.Stream;
+import org.apache.iceberg.FieldMetrics;
+import org.apache.iceberg.MetricsConfig;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.schema.MessageType;
 
 /**
@@ -44,5 +51,28 @@ public class ParquetManifestTestUtil {
   public static boolean hasLeaf(MessageType schema, String... path) {
     return schema.getColumns().stream()
         .anyMatch(column -> java.util.Arrays.equals(column.getPath(), path));
+  }
+
+  /**
+   * Runs the real Parquet metrics collection on a written data file and returns the per-field
+   * metrics keyed by field id. Exposes the genuine content-stats bounds a data file produces
+   * (including variant lower/upper bound objects built from the file's shredded column
+   * statistics), so a test can feed real stats into a manifest instead of hand-built bounds.
+   */
+  public static Map<Integer, FieldMetrics<?>> fieldMetrics(
+      InputFile dataFile, Schema schema, MetricsConfig metricsConfig) {
+    try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(dataFile))) {
+      ParquetMetadata footer = reader.getFooter();
+      MessageType type = footer.getFileMetaData().getSchema();
+      Map<Integer, FieldMetrics<?>> metricsById = Maps.newHashMap();
+      for (FieldMetrics<?> metrics :
+          ParquetMetrics.fieldMetrics(schema, type, metricsConfig, footer, Stream.empty())) {
+        metricsById.put(metrics.id(), metrics);
+      }
+
+      return metricsById;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 }

@@ -324,6 +324,10 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
      * skipping the object residual and unrequested fields (see {@code
      * ParquetSchemaUtil.pruneVariantPaths}). Bounds for unlisted variant fields are read in full.
      *
+     * <p>During scan planning (or when {@link #projectStats} narrows stats), the paths a filter
+     * references through {@code extract()} terms are added to these automatically, so a filter on a
+     * shredded variant sub-path reads only that path without the caller listing it here.
+     *
      * @param pathsByFieldId requested normalized paths per table variant field id
      */
     Builder projectStatsPaths(Map<Integer, Set<String>> pathsByFieldId) {
@@ -370,7 +374,34 @@ class V4ManifestReader extends CloseableGroup implements CloseableIterable<Track
           includeAll,
           scanMetrics,
           tableLocation,
-          variantStatsPaths);
+          statsPathsWithFilter());
+    }
+
+    /**
+     * Returns the variant stats paths to narrow the read to: the caller-supplied paths from {@link
+     * #projectStatsPaths}, plus the paths referenced by the filter's {@code extract()} terms when
+     * the read already narrows stats (scan planning or {@link #projectStats}). Filter paths are not
+     * added to a full read, which keeps complete variant bounds so entries can be copied into a new
+     * manifest without losing bounds for the paths the filter did not touch.
+     */
+    private Map<Integer, Set<String>> statsPathsWithFilter() {
+      boolean narrowsStats = scanPlanning || fieldIdsWithRequestedStats != null;
+      if (!narrowsStats || rowFilter == Expressions.alwaysTrue()) {
+        return variantStatsPaths;
+      }
+
+      Map<Integer, Set<String>> filterPaths =
+          Binder.extractPaths(tableSchema.asStruct(), ImmutableList.of(rowFilter), caseSensitive);
+      if (filterPaths.isEmpty()) {
+        return variantStatsPaths;
+      }
+
+      // union the caller-supplied and filter-derived paths per variant field id
+      Map<Integer, Set<String>> merged = Maps.newHashMap();
+      variantStatsPaths.forEach((id, paths) -> merged.put(id, Sets.newHashSet(paths)));
+      filterPaths.forEach(
+          (id, paths) -> merged.computeIfAbsent(id, ignored -> Sets.newHashSet()).addAll(paths));
+      return merged;
     }
 
     private Schema readSchema(boolean hasPartitionFilter) {
