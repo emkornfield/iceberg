@@ -65,6 +65,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -1297,6 +1298,7 @@ public class Parquet {
     private ByteBuffer fileAADPrefix = null;
     private Class<? extends StructLike> rootType = null;
     private Map<Integer, Class<? extends StructLike>> customTypes = Maps.newHashMap();
+    private Map<Integer, Set<String>> variantProjection = ImmutableMap.of();
 
     public interface ReaderFunction {
       Function<MessageType, ParquetValueReader<?>> apply();
@@ -1391,6 +1393,21 @@ public class Parquet {
 
     public ReadBuilder filter(Expression newFilter) {
       this.filter = newFilter;
+      return this;
+    }
+
+    /**
+     * Narrows shredded variant columns to a set of requested normalized JSON paths per variant
+     * field id. When set, the physical projection and the reader are pruned so a shredded bound is
+     * read from only the requested paths' columns, skipping the object residual and unrequested
+     * fields (see {@link ParquetSchemaUtil#pruneVariantPaths}). Only affects the row-based reader.
+     *
+     * @param newVariantProjection requested normalized paths per variant field id
+     * @return this builder for method chaining
+     */
+    @Override
+    public ReadBuilder withVariantProjection(Map<Integer, Set<String>> newVariantProjection) {
+      this.variantProjection = ImmutableMap.copyOf(newVariantProjection);
       return this;
     }
 
@@ -1604,7 +1621,15 @@ public class Parquet {
                   .apply();
 
           return new org.apache.iceberg.parquet.ParquetReader<>(
-              file, schema, options, readBuilder, mapping, filter, reuseContainers, caseSensitive);
+              file,
+              schema,
+              options,
+              readBuilder,
+              mapping,
+              filter,
+              reuseContainers,
+              caseSensitive,
+              variantProjection);
         }
       }
 

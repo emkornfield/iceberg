@@ -40,6 +40,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TestHelpers;
@@ -355,6 +357,37 @@ public class TestExpressionBinding {
     assertThatThrownBy(() -> Binder.bind(STRUCT, lessThan(extract("x", "$.event_id", "long"), 100)))
         .isInstanceOf(ValidationException.class)
         .hasMessage("Cannot bind extract, not a variant: x");
+  }
+
+  @Test
+  public void testExtractPathsCollectsVariantPathsByFieldId() {
+    // a filter mixing a scalar predicate with two variant extract() terms on the same field
+    Expression filter =
+        and(
+            lessThan(extract("var", "$.event_id", "long"), 100),
+            and(greaterThan("x", 5), isNull(extract("var", "$.name", "string"))));
+
+    Map<Integer, Set<String>> paths = Binder.extractPaths(STRUCT, Arrays.asList(filter), true);
+
+    // only the variant field (id 4) contributes; the scalar "x" reference is ignored
+    assertThat(paths).containsOnlyKeys(4);
+    assertThat(paths.get(4)).containsExactlyInAnyOrder("$['event_id']", "$['name']");
+  }
+
+  @Test
+  public void testExtractPathsWithoutExtractTermIsEmpty() {
+    assertThat(Binder.extractPaths(STRUCT, Arrays.asList(greaterThan("x", 5)), true)).isEmpty();
+    assertThat(Binder.extractPaths(STRUCT, null, true)).isEmpty();
+  }
+
+  @Test
+  public void testExtractPathsBindsUnboundExpression() {
+    // an already-normalized path from an unbound expression resolves to the field's stats key
+    Map<Integer, Set<String>> paths =
+        Binder.extractPaths(
+            STRUCT, Arrays.asList(lessThan(extract("var", "$.event_id", "long"), 100)), true);
+
+    assertThat(paths.get(4)).containsExactly("$['event_id']");
   }
 
   private static final String[] VALID_PATHS =

@@ -32,6 +32,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.hadoop.ParquetFileReader;
@@ -87,7 +88,8 @@ public class VectorizedParquetReader<T> extends CloseableGroup implements Closea
               nameMapping,
               reuseContainers,
               caseSensitive,
-              batchSize);
+              batchSize,
+              ImmutableMap.of());
       this.conf = readConf.copy();
       return readConf;
     }

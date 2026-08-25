@@ -19,6 +19,8 @@
 package org.apache.iceberg.parquet;
 
 import java.io.IOException;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.exceptions.RuntimeIOException;
@@ -29,6 +31,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.hadoop.ParquetFileReader;
@@ -46,6 +49,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
   private final boolean reuseContainers;
   private final boolean caseSensitive;
   private final NameMapping nameMapping;
+  private final Map<Integer, Set<String>> variantProjection;
 
   public ParquetReader(
       InputFile input,
@@ -56,6 +60,33 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
       Expression filter,
       boolean reuseContainers,
       boolean caseSensitive) {
+    this(
+        input,
+        expectedSchema,
+        options,
+        readerFunc,
+        nameMapping,
+        filter,
+        reuseContainers,
+        caseSensitive,
+        ImmutableMap.of());
+  }
+
+  /**
+   * @param variantProjection requested normalized paths per variant field id, used to narrow a
+   *     shredded variant column's projection to only the paths the read needs (see {@link
+   *     ParquetSchemaUtil#pruneVariantPaths}). Empty reads the whole variant.
+   */
+  public ParquetReader(
+      InputFile input,
+      Schema expectedSchema,
+      ParquetReadOptions options,
+      Function<MessageType, ParquetValueReader<?>> readerFunc,
+      NameMapping nameMapping,
+      Expression filter,
+      boolean reuseContainers,
+      boolean caseSensitive,
+      Map<Integer, Set<String>> variantProjection) {
     this.input = input;
     this.expectedSchema = expectedSchema;
     this.options = options;
@@ -65,6 +96,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     this.reuseContainers = reuseContainers;
     this.caseSensitive = caseSensitive;
     this.nameMapping = nameMapping;
+    this.variantProjection = variantProjection;
   }
 
   private ReadConf<T> conf = null;
@@ -82,7 +114,8 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
               nameMapping,
               reuseContainers,
               caseSensitive,
-              null);
+              null,
+              variantProjection);
       this.conf = readConf.copy();
       return readConf;
     }
